@@ -1,0 +1,143 @@
+<?xml version="1.0" encoding="UTF-8"?>
+
+<mule xmlns:jms="http://www.mulesoft.org/schema/mule/jms" xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core" xmlns:validation="http://www.mulesoft.org/schema/mule/validation"
+	xmlns:http="http://www.mulesoft.org/schema/mule/http"
+	xmlns="http://www.mulesoft.org/schema/mule/core" xmlns:doc="http://www.mulesoft.org/schema/mule/documentation" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+http://www.mulesoft.org/schema/mule/validation http://www.mulesoft.org/schema/mule/validation/current/mule-validation.xsd
+http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd
+http://www.mulesoft.org/schema/mule/jms http://www.mulesoft.org/schema/mule/jms/current/mule-jms.xsd">
+
+	<http:listener-config name="HTTP_Listener_config" doc:name="HTTP Listener config" doc:id="abb4b314-ac77-4759-b183-d299eb59396e" >
+		<http:listener-connection host="0.0.0.0" port="8081" />
+	</http:listener-config>
+
+	<jms:config name="JMS_Config" doc:name="JMS Config">
+		<jms:active-mq-connection>
+			<jms:factory-configuration brokerUrl="tcp://localhost:61616" />
+		</jms:active-mq-connection>
+	</jms:config>
+
+	<flow name="transaction-apiFlow" doc:id="ff3b2f0c-0f74-4261-8132-94552e788da2" >
+		<http:listener doc:name="Listener" doc:id="7578299e-b93a-4166-a8d7-b80926448c5f" config-ref="HTTP_Listener_config" path="/api/v1/transactions" allowedMethods="POST">
+			<http:response statusCode="#[202]">
+				<http:headers ><![CDATA[#[{"X-Correlation-Id": vars.correlationId}]]]></http:headers>
+			</http:response>
+			<http:error-response statusCode="#[vars.httpStatus default 500]" >
+				<http:body ><![CDATA[#[payload]]]></http:body>
+				<http:headers ><![CDATA[#[vars.errorHeaders default {}]]]></http:headers>
+			</http:error-response>
+		</http:listener>
+
+		<logger level="INFO" doc:name="Logger" message="Received transaction: #[payload]"/>
+
+		<validation:is-not-blank-string doc:name="Is not blank string" value="#[payload.transactionId]" message="transactionId is required"/>
+		<validation:is-not-blank-string doc:name="Is not blank string1" value="#[payload.customerId]" message="customerId is required"/>
+		<validation:is-not-blank-string doc:name="Is not blank string2" value="#[payload.currency]" message="currency is required"/>
+		<validation:is-not-blank-string doc:name="Is not blank string3" value="#[payload.channel]" message="channel is required"/>
+		<validation:is-not-null doc:name="Is not null" value="#[payload.amount]" message="amount is required"/>
+
+		<validation:is-true doc:name="Is true amount" expression="#[payload.amount &gt; 0]" message="amount must be greater than 0"/>
+		<validation:is-true doc:name="Is true currency" expression="#[['INR','USD','EUR'] contains payload.currency]" message="currency is not supported"/>
+		<validation:is-true doc:name="Is true channel" expression="#[['ONLINE','BRANCH','ATM','MOBILE'] contains payload.channel]" message="channel is not supported"/>
+
+		<set-variable value="#[uuid()]" doc:name="Set correlationId" variableName="correlationId"/>
+		<set-variable value="#[payload.transactionId]" doc:name="Set transactionId" variableName="transactionId"/>
+		<set-variable value="#[now() as String {format: &quot;yyyy-MM-dd'T'HH:mm:ss.SSSxxx&quot;}]" doc:name="Set acceptedAt" variableName="acceptedAt"/>
+		<logger level="INFO" doc:name="Logger" message="txn=#[vars.transactionId] correlationId=#[vars.correlationId] validated, publishing"/>
+
+		<ee:transform doc:name="Build SCORE_TRANSACTION message">
+			<ee:message >
+				<ee:set-payload ><![CDATA[%dw 2.0
+output application/json
+---
+{
+  eventType: "SCORE_TRANSACTION",
+  correlationId: vars.correlationId,
+  transactionId: payload.transactionId,
+  customerId: payload.customerId,
+  instrumentLast4: payload.instrumentLast4,
+  amount: payload.amount,
+  currency: payload.currency,
+  channel: payload.channel,
+  merchantId: payload.merchant.merchantId default null,
+  merchantCountry: payload.merchant.countryCode default null,
+  mcc: payload.merchant.mcc default null,
+  deviceId: payload.context.deviceId default null,
+  ipCountryCode: payload.context.ipCountryCode default null,
+  occurredAt: payload.context.occurredAt default null,
+  attempt: 1
+}]]></ee:set-payload>
+			</ee:message>
+		</ee:transform>
+
+		<jms:publish doc:name="Publish" config-ref="JMS_Config" destination="txn.scoring.queue" persistentDelivery="true">
+			<jms:message correlationId="#[vars.correlationId]" jmsType="ScoreTransaction">
+				<jms:body ><![CDATA[#[payload]]]></jms:body>
+			</jms:message>
+		</jms:publish>
+
+		<ee:transform doc:name="Build 202 response">
+			<ee:message >
+				<ee:set-payload ><![CDATA[%dw 2.0
+output application/json
+---
+{
+  transactionId: vars.transactionId,
+  status: "ACCEPTED",
+  acceptedAt: vars.acceptedAt,
+  verdictUrl: "/api/v1/transactions/" ++ vars.transactionId
+}]]></ee:set-payload>
+			</ee:message>
+		</ee:transform>
+
+		<error-handler >
+			<on-error-propagate enableNotifications="true" logException="true" doc:name="On Error Propagate Validation" type="VALIDATION:BLANK_STRING, VALIDATION:NULL, VALIDATION:INVALID_BOOLEAN">
+				<set-variable value="#[400]" doc:name="Set Variable" variableName="httpStatus"/>
+				<ee:transform doc:name="Transform Message">
+					<ee:message >
+						<ee:set-payload ><![CDATA[%dw 2.0
+output application/json
+---
+{
+  status: "REJECTED",
+  message: error.description,
+  correlationId: vars.correlationId default null
+}]]></ee:set-payload>
+					</ee:message>
+				</ee:transform>
+			</on-error-propagate>
+			<on-error-propagate enableNotifications="true" logException="true" doc:name="On Error Propagate Invalid JSON" type="MULE:EXPRESSION">
+				<set-variable value="#[400]" doc:name="Set Variable" variableName="httpStatus"/>
+				<ee:transform doc:name="Transform Message">
+					<ee:message >
+						<ee:set-payload ><![CDATA[%dw 2.0
+output application/json
+---
+{
+  status: "REJECTED",
+  message: "Request body is not valid JSON",
+  correlationId: vars.correlationId default null
+}]]></ee:set-payload>
+					</ee:message>
+				</ee:transform>
+			</on-error-propagate>
+			<on-error-propagate enableNotifications="true" logException="true" doc:name="On Error Propagate Broker Unavailable" type="JMS:CONNECTIVITY, JMS:PUBLISHING, JMS:TIMEOUT">
+				<set-variable value="#[503]" doc:name="Set httpStatus" variableName="httpStatus"/>
+				<set-variable value="#[{&quot;Retry-After&quot;: &quot;30&quot;}]" doc:name="Set errorHeaders" variableName="errorHeaders"/>
+				<ee:transform doc:name="Transform Message">
+					<ee:message >
+						<ee:set-payload ><![CDATA[%dw 2.0
+output application/json
+---
+{
+  status: "UNAVAILABLE",
+  message: "Service temporarily unavailable. Please retry.",
+  correlationId: vars.correlationId default null
+}]]></ee:set-payload>
+					</ee:message>
+				</ee:transform>
+			</on-error-propagate>
+		</error-handler>
+	</flow>
+</mule>
