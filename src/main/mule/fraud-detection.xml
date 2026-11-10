@@ -1,0 +1,549 @@
+
+<mule xmlns:db="http://www.mulesoft.org/schema/mule/db"
+      xmlns:jms="http://www.mulesoft.org/schema/mule/jms"
+      xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/jms http://www.mulesoft.org/schema/mule/jms/current/mule-jms.xsd
+        http://www.mulesoft.org/schema/mule/db http://www.mulesoft.org/schema/mule/db/current/mule-db.xsd">
+
+    <flow name="fraud-detectionFlow">
+
+        <!-- 1. Receive transaction from scoring queue -->
+        <jms:listener config-ref="JMS_Config"
+                      destination="txn.scoring.queue"
+                      doc:name="Receive Transaction"/>
+
+        <logger level="INFO"
+                message="Received transaction for fraud analysis"
+                doc:name="Log Received Transaction"/>
+
+        <!-- 2. Parse JSON message -->
+        <set-payload
+            value="#[if (payload is String) read(payload, 'application/json') else payload]"
+            doc:name="Parse Transaction JSON"/>
+
+        <set-variable variableName="transaction"
+                      value="#[payload]"
+                      doc:name="Store Transaction"/>
+
+        <!-- 3. Initialize fraud scoring -->
+        <set-variable variableName="fraudScore"
+                      value="#[0]"
+                      doc:name="Initialize Fraud Score"/>
+
+        <set-variable variableName="ruleHits"
+                      value="#[[]]"
+                      doc:name="Initialize Rule Hits"/>
+
+        <!-- 4. Fetch customer profile -->
+        <db:select config-ref="MySQL_DB_Config"
+                   target="profileRows"
+                   doc:name="Fetch Customer Profile">
+            <db:sql><![CDATA[
+                SELECT customer_id, home_country, risk_level,
+                       average_transaction_amount
+                FROM customer_profile
+                WHERE customer_id = :customerId
+            ]]></db:sql>
+            <db:input-parameters><![CDATA[#[{
+                customerId: vars.transaction.customerId
+            }]]]></db:input-parameters>
+        </db:select>
+
+        <!-- 5. Fetch previous 10-minute transaction velocity -->
+        <db:select config-ref="MySQL_DB_Config"
+                   target="velocity10Rows"
+                   doc:name="Fetch 10 Minute Velocity">
+            <db:sql><![CDATA[
+                SELECT COUNT(*) AS transaction_count,
+                       COALESCE(SUM(amount), 0) AS total_amount
+                FROM transactions
+                WHERE customer_id = :customerId
+                  AND occurred_at >= DATE_SUB(NOW(3), INTERVAL 10 MINUTE)
+                  AND transaction_id <> :transactionId
+            ]]></db:sql>
+            <db:input-parameters><![CDATA[#[{
+                customerId: vars.transaction.customerId,
+                transactionId: vars.transaction.transactionId
+            }]]]></db:input-parameters>
+        </db:select>
+
+        <!-- 6. Fetch previous 24-hour transaction velocity -->
+        <db:select config-ref="MySQL_DB_Config"
+                   target="velocity24Rows"
+                   doc:name="Fetch 24 Hour Velocity">
+            <db:sql><![CDATA[
+                SELECT COUNT(*) AS transaction_count,
+                       COALESCE(SUM(amount), 0) AS total_amount
+                FROM transactions
+                WHERE customer_id = :customerId
+                  AND occurred_at >= DATE_SUB(NOW(3), INTERVAL 24 HOUR)
+                  AND transaction_id <> :transactionId
+            ]]></db:sql>
+            <db:input-parameters><![CDATA[#[{
+                customerId: vars.transaction.customerId,
+                transactionId: vars.transaction.transactionId
+            }]]]></db:input-parameters>
+        </db:select>
+
+        <!-- 7. Check whether merchant was previously used -->
+        <db:select config-ref="MySQL_DB_Config"
+                   target="merchantRows"
+                   doc:name="Check Merchant History">
+            <db:sql><![CDATA[
+                SELECT COUNT(*) AS merchant_count
+                FROM transactions
+                WHERE customer_id = :customerId
+                  AND merchant_id = :merchantId
+                  AND merchant_id IS NOT NULL
+                  AND transaction_id <> :transactionId
+            ]]></db:sql>
+            <db:input-parameters><![CDATA[#[{
+                customerId: vars.transaction.customerId,
+                merchantId: vars.transaction.merchantId,
+                transactionId: vars.transaction.transactionId
+            }]]]></db:input-parameters>
+        </db:select>
+
+        <!-- 8. Check whether device was previously used -->
+        <db:select config-ref="MySQL_DB_Config"
+                   target="deviceRows"
+                   doc:name="Check Device History">
+            <db:sql><![CDATA[
+                SELECT COUNT(*) AS device_count
+                FROM transactions
+                WHERE customer_id = :customerId
+                  AND device_id = :deviceId
+                  AND device_id IS NOT NULL
+                  AND transaction_id <> :transactionId
+            ]]></db:sql>
+            <db:input-parameters><![CDATA[#[{
+                customerId: vars.transaction.customerId,
+                deviceId: vars.transaction.deviceId,
+                transactionId: vars.transaction.transactionId
+            }]]]></db:input-parameters>
+        </db:select>
+
+        <!-- 9. Prepare database values for rule evaluation -->
+        <set-variable variableName="customerProfile"
+                      value="#[(vars.profileRows[0] default {})]"
+                      doc:name="Prepare Customer Profile"/>
+
+        <set-variable variableName="velocity10"
+                      value="#[(vars.velocity10Rows[0] default {transaction_count: 0, total_amount: 0})]"
+                      doc:name="Prepare 10 Minute Velocity"/>
+
+        <set-variable variableName="velocity24"
+                      value="#[(vars.velocity24Rows[0] default {transaction_count: 0, total_amount: 0})]"
+                      doc:name="Prepare 24 Hour Velocity"/>
+
+        <set-variable variableName="merchantCount"
+                      value="#[((vars.merchantRows[0] default {}).merchant_count default 0) as Number]"
+                      doc:name="Prepare Merchant History"/>
+
+        <set-variable variableName="deviceCount"
+                      value="#[((vars.deviceRows[0] default {}).device_count default 0) as Number]"
+                      doc:name="Prepare Device History"/>
+
+        <set-variable variableName="insufficientData"
+                      value="#[isEmpty(vars.profileRows)]"
+                      doc:name="Check Customer Data"/>
+
+        <!-- 10. FR-001: Unusually high transaction amount -->
+        <choice doc:name="FR-001 High Amount Rule">
+            <when expression="#[
+                (vars.customerProfile.average_transaction_amount default 0) > 0
+                and vars.transaction.amount >
+                ((vars.customerProfile.average_transaction_amount default 0) * 5)
+            ]">
+                <set-variable variableName="fraudScore"
+                              value="#[vars.fraudScore + 25]"/>
+                <set-variable variableName="ruleHits"
+                              value="#[vars.ruleHits ++ [{code: 'FR-001', description: 'Transaction amount is significantly higher than customer average', severity: 'HIGH'}]]"/>
+            </when>
+        </choice>
+
+        <!-- 11. FR-002: Channel transaction limit -->
+        <choice doc:name="FR-002 Channel Limit Rule">
+            <when expression="#[
+                vars.transaction.amount >
+                ({
+                    ONLINE: 100000,
+                    BRANCH: 200000,
+                    ATM: 50000,
+                    MOBILE: 100000
+                }[vars.transaction.channel] default 100000)
+            ]">
+                <set-variable variableName="fraudScore"
+                              value="#[vars.fraudScore + 30]"/>
+                <set-variable variableName="ruleHits"
+                              value="#[vars.ruleHits ++ [{code: 'FR-002', description: 'Transaction exceeds configured channel limit', severity: 'HIGH'}]]"/>
+            </when>
+        </choice>
+
+        <!-- 12. FR-003: High transaction frequency -->
+        <choice doc:name="FR-003 Transaction Velocity Rule">
+            <when expression="#[
+                ((vars.velocity10.transaction_count default 0) as Number) + 1 > 3
+            ]">
+                <set-variable variableName="fraudScore"
+                              value="#[vars.fraudScore + 20]"/>
+                <set-variable variableName="ruleHits"
+                              value="#[vars.ruleHits ++ [{code: 'FR-003', description: 'Customer exceeded transaction count limit in 10 minutes', severity: 'HIGH'}]]"/>
+            </when>
+        </choice>
+
+        <!-- 13. FR-004: Daily transaction amount limit -->
+        <choice doc:name="FR-004 Daily Limit Rule">
+            <when expression="#[
+                ((vars.velocity24.total_amount default 0) as Number)
+                + (vars.transaction.amount as Number) > 100000
+            ]">
+                <set-variable variableName="fraudScore"
+                              value="#[vars.fraudScore + 20]"/>
+                <set-variable variableName="ruleHits"
+                              value="#[vars.ruleHits ++ [{code: 'FR-004', description: 'Customer exceeded configured 24 hour transaction amount limit', severity: 'HIGH'}]]"/>
+            </when>
+        </choice>
+
+        <!-- 14. FR-005: First-seen merchant -->
+        <choice doc:name="FR-005 New Merchant Rule">
+            <when expression="#[
+                !isEmpty(vars.transaction.merchantId default '')
+                and vars.merchantCount == 0
+            ]">
+                <set-variable variableName="fraudScore"
+                              value="#[vars.fraudScore + 15]"/>
+                <set-variable variableName="ruleHits"
+                              value="#[vars.ruleHits ++ [{code: 'FR-005', description: 'Transaction uses a merchant not previously seen for this customer', severity: 'MEDIUM'}]]"/>
+            </when>
+        </choice>
+
+        <!-- 15. FR-006: Merchant country mismatch -->
+        <choice doc:name="FR-006 Merchant Country Rule">
+            <when expression="#[
+                !isEmpty(vars.customerProfile.home_country default '')
+                and !isEmpty(vars.transaction.merchantCountry default '')
+                and upper(vars.transaction.merchantCountry) != upper(vars.customerProfile.home_country)
+            ]">
+                <set-variable variableName="fraudScore"
+                              value="#[vars.fraudScore + 15]"/>
+                <set-variable variableName="ruleHits"
+                              value="#[vars.ruleHits ++ [{code: 'FR-006', description: 'Merchant country differs from customer home country', severity: 'MEDIUM'}]]"/>
+            </when>
+        </choice>
+
+        <!-- 16. FR-007: First-seen device -->
+        <choice doc:name="FR-007 New Device Rule">
+            <when expression="#[
+                !isEmpty(vars.transaction.deviceId default '')
+                and vars.deviceCount == 0
+            ]">
+                <set-variable variableName="fraudScore"
+                              value="#[vars.fraudScore + 15]"/>
+                <set-variable variableName="ruleHits"
+                              value="#[vars.ruleHits ++ [{code: 'FR-007', description: 'Transaction uses a device not previously seen for this customer', severity: 'MEDIUM'}]]"/>
+            </when>
+        </choice>
+
+        <!-- 17. FR-008: IP country mismatch -->
+        <choice doc:name="FR-008 IP Country Rule">
+            <when expression="#[
+                !isEmpty(vars.customerProfile.home_country default '')
+                and !isEmpty(vars.transaction.ipCountryCode default '')
+                and upper(vars.transaction.ipCountryCode) != upper(vars.customerProfile.home_country)
+            ]">
+                <set-variable variableName="fraudScore"
+                              value="#[vars.fraudScore + 10]"/>
+                <set-variable variableName="ruleHits"
+                              value="#[vars.ruleHits ++ [{code: 'FR-008', description: 'IP country differs from customer home country', severity: 'MEDIUM'}]]"/>
+            </when>
+        </choice>
+
+        <!-- 18. FR-009: Transaction outside usual hours -->
+        <choice doc:name="FR-009 Unusual Time Rule">
+            <when expression="#[
+                now().hour &lt; 8 or now().hour >= 22
+            ]">
+                <set-variable variableName="fraudScore"
+                              value="#[vars.fraudScore + 10]"/>
+                <set-variable variableName="ruleHits"
+                              value="#[vars.ruleHits ++ [{code: 'FR-009', description: 'Transaction received outside configured usual hours of 08:00 to 22:00', severity: 'LOW'}]]"/>
+            </when>
+        </choice>
+
+        <!-- 19. FR-010: High-risk merchant category -->
+
+<choice doc:name="FR-010 High Risk MCC Rule">
+    <when expression="#[contains(['7995', '5967', '4829'], (vars.transaction.mcc default '') as String)]">
+        <set-variable variableName="fraudScore"
+                      value="#[vars.fraudScore + 20]"/>
+        <set-variable variableName="ruleHits"
+                      value="#[vars.ruleHits ++ [{code: 'FR-010', description: 'Transaction belongs to a configured high-risk merchant category', severity: 'HIGH'}]]"/>
+    </when>
+</choice>
+
+
+        <!-- 20. Cap score at 100 -->
+        <set-variable variableName="finalScore"
+                      value="#[min([vars.fraudScore, 100])] "
+                      doc:name="Calculate Final Score"/>
+
+        <!-- 21. Determine verdict -->
+        <set-variable variableName="verdict"
+                      value="#[
+                        if (vars.insufficientData) 'REVIEW'
+                        else if (vars.finalScore >= 70) 'DECLINE'
+                        else if (vars.finalScore >= 30) 'REVIEW'
+                        else 'APPROVE'
+                      ]"
+                      doc:name="Determine Fraud Verdict"/>
+
+        <!-- 22. Determine reason code -->
+        <set-variable variableName="reasonCode"
+                      value="#[
+                        if (vars.insufficientData) 'INSUFFICIENT_CUSTOMER_DATA'
+                        else if (vars.verdict == 'DECLINE') 'HIGH_FRAUD_RISK'
+                        else if (vars.verdict == 'REVIEW') 'SUSPICIOUS_TRANSACTION'
+                        else if (!isEmpty(vars.ruleHits)) 'LOW_RISK_RULE_MATCH'
+                        else 'NORMAL_TRANSACTION'
+                      ]"
+                      doc:name="Determine Reason Code"/>
+
+
+
+                 <logger level="INFO"
+                  doc:name="Log Fraud Result"
+                      message="#[%dw 2.0
+                output text/plain
+                 ---
+                'Fraud analysis completed. Transaction=' ++
+                  (vars.transaction.transactionId as String) ++
+                ', Score=' ++
+                 (vars.finalScore as String) ++
+                ', Verdict=' ++
+                (vars.verdict as String)]"/>
+
+
+
+        <!-- 23. Insert or update transaction -->
+        <db:insert config-ref="MySQL_DB_Config"
+                   doc:name="Save Transaction">
+            <db:sql><![CDATA[
+                INSERT INTO transactions (
+                    transaction_id, customer_id, instrument_last4,
+                    amount, currency, channel, merchant_id,
+                    merchant_country, mcc, device_id, ip_country_code,
+                    occurred_at, correlation_id, processing_status
+                )
+                VALUES (
+                    :transactionId, :customerId, :instrumentLast4,
+                    :amount, :currency, :channel, :merchantId,
+                    :merchantCountry, :mcc, :deviceId, :ipCountryCode,
+                    :occurredAt, :correlationId, :processingStatus
+                )
+                ON DUPLICATE KEY UPDATE
+                    processing_status = VALUES(processing_status),
+                    correlation_id = VALUES(correlation_id)
+            ]]></db:sql>
+            <db:input-parameters><![CDATA[#[{
+                transactionId: vars.transaction.transactionId,
+                customerId: vars.transaction.customerId,
+                instrumentLast4: vars.transaction.instrumentLast4 default null,
+                amount: vars.transaction.amount,
+                currency: vars.transaction.currency,
+                channel: vars.transaction.channel,
+                merchantId: vars.transaction.merchantId default null,
+                merchantCountry: vars.transaction.merchantCountry default null,
+                mcc: vars.transaction.mcc default null,
+                deviceId: vars.transaction.deviceId default null,
+                ipCountryCode: vars.transaction.ipCountryCode default null,
+                occurredAt:
+                    if (vars.transaction.occurredAt == null)
+                        null
+                    else
+                        ((vars.transaction.occurredAt as DateTime) as LocalDateTime),
+                correlationId: vars.transaction.correlationId default null,
+                processingStatus: vars.verdict
+            }]]]></db:input-parameters>
+        </db:insert>
+
+        <!-- 24. Insert or update fraud score -->
+        <db:insert config-ref="MySQL_DB_Config"
+                   doc:name="Save Fraud Score">
+            <db:sql><![CDATA[
+                INSERT INTO fraud_scores (
+                    transaction_id, fraud_score, verdict,
+                    model_version, reason
+                )
+                VALUES (
+                    :transactionId, :fraudScore, :verdict,
+                    :modelVersion, :reason
+                )
+                ON DUPLICATE KEY UPDATE
+                    fraud_score = VALUES(fraud_score),
+                    verdict = VALUES(verdict),
+                    model_version = VALUES(model_version),
+                    reason = VALUES(reason),
+                    scored_at = CURRENT_TIMESTAMP
+            ]]></db:sql>
+            <db:input-parameters><![CDATA[#[{
+                transactionId: vars.transaction.transactionId,
+                fraudScore: vars.finalScore,
+                verdict: vars.verdict,
+                modelVersion: 'RULE_ENGINE_V1',
+                reason: vars.reasonCode
+            }]]]></db:input-parameters>
+        </db:insert>
+
+        <!-- 25. Remove previous rule hits for this transaction -->
+        <db:delete config-ref="MySQL_DB_Config"
+                   doc:name="Clear Previous Rule Hits">
+            <db:sql><![CDATA[
+                DELETE FROM fraud_rule_hits
+                WHERE transaction_id = :transactionId
+            ]]></db:sql>
+            <db:input-parameters><![CDATA[#[{
+                transactionId: vars.transaction.transactionId
+            }]]]></db:input-parameters>
+        </db:delete>
+
+        <!-- 26. Save each triggered fraud rule -->
+        <foreach collection="#[vars.ruleHits]"
+                 doc:name="Save Fraud Rule Hits">
+
+            <db:insert config-ref="MySQL_DB_Config"
+                       doc:name="Insert Fraud Rule Hit">
+                <db:sql><![CDATA[
+                    INSERT INTO fraud_rule_hits (
+                        transaction_id, rule_code,
+                        rule_description, severity
+                    )
+                    VALUES (
+                        :transactionId, :ruleCode,
+                        :ruleDescription, :severity
+                    )
+                ]]></db:sql>
+                <db:input-parameters><![CDATA[#[{
+                    transactionId: vars.transaction.transactionId,
+                    ruleCode: payload.code,
+                    ruleDescription: payload.description,
+                    severity: payload.severity
+                }]]]></db:input-parameters>
+            </db:insert>
+
+        </foreach>
+
+        <!-- 27. Update customer velocity windows when profile exists -->
+        <choice doc:name="Update Customer Velocity">
+            <when expression="#[!vars.insufficientData]">
+
+                <!-- 10-minute window -->
+                <db:insert config-ref="MySQL_DB_Config"
+                           doc:name="Update 10 Minute Velocity">
+                    <db:sql><![CDATA[
+                        INSERT INTO customer_velocity (
+                            customer_id, window_minutes, window_start,
+                            transaction_count, total_amount
+                        )
+                        VALUES (
+                            :customerId, 10,
+                            DATE_SUB(
+                                NOW(),
+                                INTERVAL MOD(MINUTE(NOW()), 10) MINUTE
+                            ),
+                            :transactionCount, :totalAmount
+                        )
+                        ON DUPLICATE KEY UPDATE
+                            transaction_count = VALUES(transaction_count),
+                            total_amount = VALUES(total_amount)
+                    ]]></db:sql>
+                    <db:input-parameters><![CDATA[#[{
+                        customerId: vars.transaction.customerId,
+                        transactionCount:
+                            ((vars.velocity10.transaction_count default 0) as Number) + 1,
+                        totalAmount:
+                            ((vars.velocity10.total_amount default 0) as Number)
+                            + (vars.transaction.amount as Number)
+                    }]]]></db:input-parameters>
+                </db:insert>
+
+                <!-- 24-hour window -->
+                <db:insert config-ref="MySQL_DB_Config"
+                           doc:name="Update 24 Hour Velocity">
+                    <db:sql><![CDATA[
+                        INSERT INTO customer_velocity (
+                            customer_id, window_minutes, window_start,
+                            transaction_count, total_amount
+                        )
+                        VALUES (
+                            :customerId, 1440, CURDATE(),
+                            :transactionCount, :totalAmount
+                        )
+                        ON DUPLICATE KEY UPDATE
+                            transaction_count = VALUES(transaction_count),
+                            total_amount = VALUES(total_amount)
+                    ]]></db:sql>
+                    <db:input-parameters><![CDATA[#[{
+                        customerId: vars.transaction.customerId,
+                        transactionCount:
+                            ((vars.velocity24.transaction_count default 0) as Number) + 1,
+                        totalAmount:
+                            ((vars.velocity24.total_amount default 0) as Number)
+                            + (vars.transaction.amount as Number)
+                    }]]]></db:input-parameters>
+                </db:insert>
+
+            </when>
+        </choice>
+
+        <!-- 28. Publish fraud alert without changing email integration contract -->
+        <choice doc:name="Publish Fraud Alert">
+
+            <when expression="#[vars.verdict == 'REVIEW' or vars.verdict == 'DECLINE']">
+
+
+<set-payload doc:name="Build Fraud Alert"
+             value="#[output application/java
+---
+{
+    eventType: 'FRAUD_ALERT',
+    correlationId: vars.transaction.correlationId default null,
+    transactionId: vars.transaction.transactionId,
+    customerId: vars.transaction.customerId,
+    verdict: vars.verdict,
+    score: vars.finalScore,
+    firedRules: vars.ruleHits,
+    customerReasonCode: vars.reasonCode
+}]"/>
+
+
+
+<jms:publish config-ref="JMS_Config"
+             destination="txn.alert.queue"
+             doc:name="Publish Fraud Alert">
+    <jms:message>
+        <jms:body><![CDATA[#[write(payload, "application/json")]]]></jms:body>
+    </jms:message>
+</jms:publish>
+
+
+                <logger level="WARN"
+                        message="#['Fraud alert published for transaction ' ++ vars.transaction.transactionId]"
+                        doc:name="Log Fraud Alert"/>
+
+            </when>
+
+            <otherwise>
+                <logger level="INFO"
+                        message="#['Transaction approved: ' ++ vars.transaction.transactionId]"
+                        doc:name="Log Approved Transaction"/>
+            </otherwise>
+
+        </choice>
+
+    </flow>
+</mule>
