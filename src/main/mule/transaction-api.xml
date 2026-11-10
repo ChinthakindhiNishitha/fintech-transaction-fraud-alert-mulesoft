@@ -140,4 +140,21 @@ output application/json
 			</on-error-propagate>
 		</error-handler>
 	</flow>
+		<flow name="get-transactionFlow">
+		<http:listener doc:name="Listener GET" config-ref="HTTP_Listener_config" path="/api/v1/transactions/{transactionId}" allowedMethods="GET"/>
+		<logger level="INFO" doc:name="Logger" message="Verdict query for txn=#[attributes.uriParams.transactionId]"/>
+		<ee:transform doc:name="Build pending response">
+			<ee:message >
+				<ee:set-payload ><![CDATA[%dw 2.0
+output application/json
+---
+{
+  transactionId: attributes.uriParams.transactionId,
+  status: "ACCEPTED",
+  verdict: null,
+  message: "Scoring in progress."
+}]]></ee:set-payload>
+			</ee:message>
+		</ee:transform>
+	</flow>
 </mule>
